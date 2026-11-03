@@ -1,12 +1,12 @@
-"""Parity checks for the batched ``K``-lane East River runner.
+"""Parity checks for the batched multi-lane East River runner.
 
 Two levels of verification against independent references:
 
-1. ``K = 1``: the batched runner with a single lane must reproduce the saved
+1. Batch size 1: the batched runner with a single lane must reproduce the saved
    scalar forward ``.pkl`` byte-for-byte (streamflow within ``1e-9`` relative,
    river DOC within ``1e-9`` relative, objective dicts within ``1e-9``
    absolute).
-2. ``K = 3``: three lanes must agree with three *independent* scalar
+2. Batch size 3: three lanes must agree with three *independent* scalar
    ``arr_to_results`` runs (the showcase pipeline itself), comparing the full
    ``sim_streamflow_mmd`` / ``DOC_riv`` series and the objective dicts.
 
@@ -124,10 +124,14 @@ def scalars_for(
 ) -> list[dict[str, Any]]:
     """Run one independent scalar ``arr_to_results`` per lane."""
     out: list[dict[str, Any]] = []
-    for k in range(int(params.shape[0])):
-        res = arr_to_results(params[k], cfg, hydro_criteria=None, verbose=False)  # type: ignore[arg-type]
+    for lane in range(int(params.shape[0])):
+        res = arr_to_results(  # type: ignore[arg-type]
+            params[lane], cfg, hydro_criteria=None, verbose=False
+        )
         if isinstance(res, pt.HydroModelResults):
-            raise RuntimeError(f"lane {k}: scalar run returned hydrology-only results")
+            raise RuntimeError(
+                f"lane {lane}: scalar run returned hydrology-only results"
+            )
         hydro: pt.HydroModelResults = res.hydro
         rt: pt.RtModelResults = res.reactive_transport
         hydro_obj: dict[str, float] = {
@@ -148,7 +152,9 @@ def scalars_for(
     return out
 
 
-def check_k1(batched: pt.BatchedRunOutput, oracle: dict[str, Any]) -> bool:
+def check_single_lane(
+    batched: pt.BatchedRunOutput, oracle: dict[str, Any]
+) -> bool:
     """Verify the single-lane run against the saved scalar ``.pkl``."""
     q_ref: np.ndarray = oracle["q_sim"].to_numpy(dtype=float)  # type: ignore[union-attr]
     doc_ref: np.ndarray = oracle["doc_sim"].to_numpy(dtype=float)  # type: ignore[union-attr]
@@ -193,20 +199,23 @@ def check_k1(batched: pt.BatchedRunOutput, oracle: dict[str, Any]) -> bool:
     return ok
 
 
-def check_k3(
+def check_three_lanes(
     batched: pt.BatchedRunOutput,
     scalar_res: list[dict[str, Any]],
     overflow: list[bool],
 ) -> bool:
     """Verify every lane against its independent scalar run."""
     ok: bool = True
-    for k, (s, ovfl) in enumerate(zip(scalar_res, overflow, strict=True)):
-        tag: str = f"lane {k}"
+    for lane, (s, ovfl) in enumerate(zip(scalar_res, overflow, strict=True)):
+        tag: str = f"lane {lane}"
         if ovfl:
-            print(f"   [SKIP] {tag}: scalar WaterVolumeError (batched overflow_mask set)")
+            print(
+                f"   [SKIP] {tag}: scalar WaterVolumeError "
+                "(batched overflow_mask set)"
+            )
             continue
-        q_sim: np.ndarray = batched.q_sim[k].detach().cpu().numpy()
-        doc_riv: np.ndarray = batched.doc_riv[k].detach().cpu().numpy()
+        q_sim: np.ndarray = batched.q_sim[lane].detach().cpu().numpy()
+        doc_riv: np.ndarray = batched.doc_riv[lane].detach().cpu().numpy()
         ok &= report(
             f"{tag} q_sim", max_abs_rel(q_sim, s["q_sim"]) <= TOL_REL,
             f"max-abs-rel={max_abs_rel(q_sim, s['q_sim']):.3e}",
@@ -219,12 +228,12 @@ def check_k3(
             for key in s[name]:  # type: ignore[index]
                 diff: float = (
                     abs(
-                        float(batched.hydro_objectives[k][key])
+                        float(batched.hydro_objectives[lane][key])
                         - float(s[name][key])  # type: ignore[index]
                     )
                     if name == "hydro_obj"
                     else abs(
-                        float(batched.rt_doc_objectives[k][key])
+                        float(batched.rt_doc_objectives[lane][key])
                         - float(s[name][key])  # type: ignore[index]
                     )
                 )
@@ -245,17 +254,17 @@ def run(args: argparse.Namespace) -> int:
     arr: np.ndarray = oracle["param_series"].to_numpy()  # type: ignore[union-attr]
     assert arr.shape[0] == oracle["n_params"]  # type: ignore[arg-type]
 
-    # ---- Stage 1: K = 1 vs oracle ---- #
-    print("\n== Stage 1: K = 1 batched run vs saved scalar pkl ==")
+    # ---- Stage 1: batch size 1 vs oracle ---- #
+    print("\n== Stage 1: batch size 1 batched run vs saved scalar pkl ==")
     t0: float = time.perf_counter()
     batched1: pt.BatchedRunOutput = pt.run_hydro_rt_batched(
         arr.reshape(1, -1), cfg, torch.device("cpu"), torch.float64
     )
-    print(f"   batched K=1 wall: {time.perf_counter() - t0:.3f}s")
-    ok1: bool = check_k1(batched1, oracle)
+    print(f"   batched batch size 1 wall: {time.perf_counter() - t0:.3f}s")
+    ok1: bool = check_single_lane(batched1, oracle)
 
-    # ---- Stage 2: K = 3 vs per-lane scalar runs ---- #
-    print("\n== Stage 2: K = 3 batched run vs 3 independent scalar runs ==")
+    # ---- Stage 2: batch size 3 vs per-lane scalar runs ---- #
+    print("\n== Stage 2: batch size 3 batched run vs 3 independent scalar runs ==")
     torch.manual_seed(args.seed)
     inputs = load_input_data(
         pt.HbvLateralModel, test_wys=[2017, 2020], val_wy=2018, site="EastRiver"
@@ -270,14 +279,17 @@ def run(args: argparse.Namespace) -> int:
         params, cfg, torch.device("cpu"), torch.float64
     )
     t_batched: float = time.perf_counter() - t1
-    print(f"   batched K=3 wall: {t_batched:.3f}s ({t_batched / 3:.3f}s/lane)")
+    print(
+        f"   batched batch size 3 wall: {t_batched:.3f}s "
+        f"({t_batched / 3:.3f}s/lane)"
+    )
 
     scalar_res: list[dict[str, Any]] = []
     overflow_lanes: list[bool] = []
     t2: float = time.perf_counter()
-    for k in range(3):
+    for lane in range(3):
         try:
-            scalar_res.append(scalars_for(params[k : k + 1], cfg)[0])
+            scalar_res.append(scalars_for(params[lane : lane + 1], cfg)[0])
             overflow_lanes.append(False)
         except pt.WaterVolumeError:
             overflow_lanes.append(True)
@@ -285,14 +297,17 @@ def run(args: argparse.Namespace) -> int:
         except Exception:
             raise
     t_scalar: float = time.perf_counter() - t2
-    print(f"   scalar K=3 wall: {t_scalar:.3f}s ({t_scalar / 3:.3f}s/lane)")
+    print(
+        f"   scalar batch size 3 wall: {t_scalar:.3f}s "
+        f"({t_scalar / 3:.3f}s/lane)"
+    )
 
-    ok2: bool = check_k3(batched3, scalar_res, overflow_lanes)
+    ok2: bool = check_three_lanes(batched3, scalar_res, overflow_lanes)
 
     # ---- Summary ---- #
     print("\n== Parity summary ==")
-    print(f"   Stage 1 (K=1 vs pkl):      {'PASS' if ok1 else 'FAIL'}")
-    print(f"   Stage 2 (K=3 vs scalar):   {'PASS' if ok2 else 'FAIL'}")
+    print(f"   Stage 1 (batch size 1 vs pkl):    {'PASS' if ok1 else 'FAIL'}")
+    print(f"   Stage 2 (batch size 3 vs scalar): {'PASS' if ok2 else 'FAIL'}")
     ok_all: bool = ok1 and ok2
     print(f"   overall: {'PASS' if ok_all else 'FAIL'}")
     return 0 if ok_all else 1

@@ -1,5 +1,10 @@
 # Full Optimization Plan: East River Forward Simulation
 
+> **Terminology note:** in historical entries below, `K` denotes the batch
+> size — the number of identical parameter sets (lanes) advanced together in
+> one batched call. Current code and scripts use the explicit name
+> `batch_size`.
+
 ## URGENT track — cut GPU host-device syncs (K=1 target < 10 s)
 
 Measured starting point: the East-River full record (2557 d, K=1, CUDA f32)

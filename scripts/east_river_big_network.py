@@ -83,16 +83,7 @@ from potions import (
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
 DEFAULT_INPUT: Final[Path] = REPO_ROOT / "inputs" / "east_river_series.csv"
-DEFAULT_PARAMS_CSV: Final[Path] = (
-    REPO_ROOT.parent
-    / "potions-showcase"
-    / "data"
-    / "modeling"
-    / "outputs"
-    / "east_river"
-    / "polished_output_three_layer_big_network"
-    / "final_params.csv"
-)
+DEFAULT_PARAMS_CSV: Final[Path] = REPO_ROOT / "scripts" / "final_params.csv"
 DEFAULT_OUTPUT_DIR: Final[Path] = REPO_ROOT / "outputs" / "east_river_big_network"
 
 #: Network species, in the network's internal order: primary aqueous,
@@ -683,7 +674,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--params",
         type=Path,
         default=DEFAULT_PARAMS_CSV,
-        help="showcase final_params.csv to remap (default: %(default)s)",
+        help="parameter CSV to remap (default: %(default)s)",
     )
     parser.add_argument(
         "--output-dir",

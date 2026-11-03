@@ -6,14 +6,14 @@ parameter set and runs the zone-by-zone Python orchestrators
 ``ReactiveTransportModel.step_rt_model``.  Both loops encode the *batch
 dimension as zones* (a ``(B,)`` state) and flatten the flux accumulation back
 to 1-D, so they cannot carry independent parameter sets as an extra leading
-``K`` batch axis.
+batch-size axis.
 
 This module provides a self-contained *batched runner* that mirrors the scalar
 semantics lane-by-lane while reusing the already-batched zone kernels
 (``HydrologicZone.step``, :meth:`RtZone.step_with_params` and the vectorised
-speciation solve in ``potions.equilibrium``).  A ``K``-lane run reproduces the
-saved scalar forward exactly when those ``K`` sets are run individually through
-the scalar pipeline.
+speciation solve in ``potions.equilibrium``).  A run with batch size N
+reproduces the saved scalar forward exactly when those N parameter sets are
+run individually through the scalar pipeline.
 
 Layout conventions (East River / :class:`HbvLateralModel`):
 
@@ -35,8 +35,8 @@ Layout conventions (East River / :class:`HbvLateralModel`):
   ``run_hydro_model`` and river-concentration fixes.
 
 The runner is *honest* about its concurrency ceiling: reactive transport is a
-Gauss-Seidel sweep over the zones per step (each a ``K``-lane batched Newton /
-LM solve), so throughput gains are sublinear in ``K``.
+Gauss-Seidel sweep over the zones per step (each a batched Newton / LM solve
+across all lanes), so throughput gains are sublinear in the batch size.
 """
 
 from __future__ import annotations
@@ -135,15 +135,17 @@ class BatchedRunOutput:
     """Per-lane simulation results for a batched forward run.
 
     Attributes:
-        q_sim:             ``(K, num_steps)`` streamflow [mm/day].
-        doc_riv:           ``(K, num_steps)`` flow-weighted river DOC [mmol/L].
+        q_sim:             ``(batch_size, num_steps)`` streamflow [mm/day].
+        doc_riv:           ``(batch_size, num_steps)`` flow-weighted river DOC
+            [mmol/L].
         hydro_objectives:  per-lane hydro objective dicts (same keys/order as
             the scalar hydrology run).
         rt_doc_objectives: per-lane RT DOC objective dicts (same keys/order as
             the scalar ``DOC_riv`` scoring).
-        overflow_mask:     ``(K,)`` ``True`` for lanes whose storage touched
-            the zone maximum water volume (the scalar path would abort those
-            runs with a ``WaterVolumeError``; the batched path keeps going).
+        overflow_mask:     ``(batch_size,)`` ``True`` for lanes whose storage
+            touched the zone maximum water volume (the scalar path would abort
+            those runs with a ``WaterVolumeError``; the batched path keeps
+            going).
     """
 
     q_sim: Tensor
@@ -233,7 +235,7 @@ def _build_rt_forcing(
     hydro_step: HydroStep,
     zone_forc: HydroForcing,
     s_w: Tensor,
-    K: int,
+    batch_size: int,
     dtype: torch.dtype,
     device: torch.device,
 ) -> RtForcing:
@@ -243,7 +245,7 @@ def _build_rt_forcing(
         hydro_step=hydro_step,
         hydro_forc=zone_forc,
         s_w=s_w,
-        z_w=torch.zeros(K, dtype=dtype, device=device),
+        z_w=torch.zeros(batch_size, dtype=dtype, device=device),
     )
 
 
@@ -251,7 +253,7 @@ def _compute_cin_sources(
     is_surface: bool,
     i: int,
     surface_idx: dict[int, int],
-    K: int,
+    batch_size: int,
     ns: int,
     precip_conc_gpu: Tensor,
     lat_mass: Tensor,
@@ -277,25 +279,27 @@ def _compute_cin_sources(
         is_surface:    whether zone ``i`` is a surface (precip-fed) zone.
         i:             flat zone index.
         surface_idx:   flat zone index -> row of ``precip_conc_gpu``.
-        K:             batch size.
+        batch_size:    number of lanes in the batch.
         ns:            number of species.
         precip_conc_gpu: ``(num_surface, num_steps, num_species)`` precipitation
             chemistry on the compute device.
-        lat_mass:      ``(K, num_zones, num_species)`` lateral mass that each
-            zone exports once solved this step.
-        vert_mass:     ``(K, num_zones, num_species)`` vertical mass exports.
+        lat_mass:      ``(batch_size, num_zones, num_species)`` lateral mass that
+            each zone exports once solved this step.
+        vert_mass:     ``(batch_size, num_zones, num_species)`` vertical mass
+            exports.
         lat_mat:       ``(num_zones, num_zones)`` lateral connectivity rows.
         vert_mat:      ``(num_zones, num_zones)`` vertical connectivity rows.
-        hydro:         ``(K, num_steps, num_zones)`` hydrology outputs.
+        hydro:         ``(batch_size, num_steps, num_zones)`` hydrology outputs.
         t:             simulation step index.
         dtype:         compute dtype.
         device:        compute device.
 
     Returns:
-        ``(K, num_species)`` incoming concentrations for zone ``i`` at step ``t``.
+        ``(batch_size, num_species)`` incoming concentrations for zone ``i`` at
+        step ``t``.
     """
     if is_surface:
-        return precip_conc_gpu[surface_idx[i], t].expand(K, ns)
+        return precip_conc_gpu[surface_idx[i], t].expand(batch_size, ns)
     mass_in: Tensor = (
         lat_mass.transpose(1, 2) @ lat_mat[i]
         + vert_mass.transpose(1, 2) @ vert_mat[i]
@@ -304,7 +308,7 @@ def _compute_cin_sources(
     return torch.where(
         tot_water_in.unsqueeze(-1) > 1e-6,
         mass_in / tot_water_in.unsqueeze(-1),
-        torch.zeros(K, ns, dtype=dtype, device=device),
+        torch.zeros(batch_size, ns, dtype=dtype, device=device),
     )
 
 
@@ -327,21 +331,22 @@ def run_rt_batched(
     Mirrors ``ReactiveTransportModel.run_rt_model`` / ``step_rt_model`` with
     lane-batched species states.  For every zone ``i`` of every step the
     incoming mass is aggregated over the upstream export rows already solved:
-    ``lat_mass.transpose(1, 2) @ lat_mat[i]`` yields the ``(K, num_species)``
-    incoming mass per lane (the scalar ``(num_zones, num_species)`` form is the
-    ``K = 1`` special case).  Kinetic steps pass per-lane depth / auxiliary
-    parameters explicitly so one zone object serves all lanes while keeping its
-    per-zone, cross-lane speciation warm-start.
+    ``lat_mass.transpose(1, 2) @ lat_mat[i]`` yields the
+    ``(batch_size, num_species)`` incoming mass per lane (the scalar
+    ``(num_zones, num_species)`` form is the batch-size-1 special case).
+    Kinetic steps pass per-lane depth / auxiliary parameters explicitly so one
+    zone object serves all lanes while keeping its per-zone, cross-lane
+    speciation warm-start.
 
     Args:
         geometry:    connectivity (``lat_mat`` / ``vert_mat`` / surface ids).
         rt_zones:    per-lane reactive-transport zones (flat order).
-        hydro:       hydrology outputs (``(K, T, Z)`` arrays).
-        zone_precip: ``(K, T, Z)`` per-zone precipitation (hydro forcing).
-        zone_temp:   ``(K, T, Z)`` per-zone temperature.
-        zone_pet:    ``(K, T, Z)`` per-zone PET.
+        hydro:       hydrology outputs (``(batch_size, T, Z)`` arrays).
+        zone_precip: ``(batch_size, T, Z)`` per-zone precipitation (hydro forcing).
+        zone_temp:   ``(batch_size, T, Z)`` per-zone temperature.
+        zone_pet:    ``(batch_size, T, Z)`` per-zone PET.
         precip_conc: ``(num_surface, T, num_spec)`` surface precipitation chemistry.
-        init_state:  ``(K, Z, num_spec)`` initial concentrations.
+        init_state:  ``(batch_size, Z, num_spec)`` initial concentrations.
         dates:       simulation timestamps.
         device:      compute device.
         dtype:       compute dtype.
@@ -349,11 +354,11 @@ def run_rt_batched(
             float32 compute with float64 convergence checks).
 
     Returns:
-        ``(state (T, K, Z, num_spec), overflow (K, Z))`` where ``overflow[k, z]``
-        is true when lane ``k`` saturated zone ``z`` (the scalar path would raise
-        a ``WaterVolumeError`` there).
+        ``(state (T, batch_size, Z, num_spec), overflow (batch_size, Z))``
+        where ``overflow[lane, zone]`` is true when that lane saturated that
+        zone (the scalar path would raise a ``WaterVolumeError`` there).
     """
-    K: int = int(init_state.shape[0])
+    batch_size: int = int(init_state.shape[0])
     Z: int = int(init_state.shape[1])
     ns: int = int(init_state.shape[2])
     num_steps: int = int(precip_conc.shape[1])
@@ -363,13 +368,15 @@ def run_rt_batched(
     vert_mat: Tensor = geometry.vert_mat.to(dtype=dtype, device=device)
     is_surface: list[bool] = [i in geometry.surface_ids for i in range(Z)]
 
-    lat_mass: Tensor = torch.zeros(K, Z, ns, dtype=dtype, device=device)
-    vert_mass: Tensor = torch.zeros(K, Z, ns, dtype=dtype, device=device)
+    lat_mass: Tensor = torch.zeros(batch_size, Z, ns, dtype=dtype, device=device)
+    vert_mass: Tensor = torch.zeros(batch_size, Z, ns, dtype=dtype, device=device)
 
     state: Tensor = init_state.clone()
     # Pre-allocate state_out to avoid per-step clone + stack
-    state_out: Tensor = torch.empty(num_steps, K, Z, ns, dtype=dtype, device=device)
-    overflow: Tensor = torch.zeros(K, Z, dtype=torch.bool, device=device)
+    state_out: Tensor = torch.empty(
+        num_steps, batch_size, Z, ns, dtype=dtype, device=device
+    )
+    overflow: Tensor = torch.zeros(batch_size, Z, dtype=torch.bool, device=device)
 
     per_zone_v: list[Tensor] = []
     per_zone_passive: list[Tensor] = []
@@ -411,7 +418,7 @@ def run_rt_batched(
                     is_surface[i],
                     i,
                     surface_idx,
-                    K,
+                    batch_size,
                     ns,
                     precip_conc_gpu,
                     lat_mass,
@@ -432,10 +439,10 @@ def run_rt_batched(
                     precip=zone_precip[:, t, i],
                     temp=zone_temp[:, t, i],
                     pet=zone_pet[:, t, i],
-                    q_in=torch.zeros(K, dtype=dtype, device=device),
+                    q_in=torch.zeros(batch_size, dtype=dtype, device=device),
                 )
                 d: RtForcing = _build_rt_forcing(
-                    cin_sources, hs, zone_forc, s_w, K, dtype, device
+                    cin_sources, hs, zone_forc, s_w, batch_size, dtype, device
                 )
                 step = zone.step_with_params(
                     c_0=state[:, i].clone(),
@@ -465,10 +472,10 @@ def run_hydro_rt_batched(
     init_aq_conc: float = 1e-3,
     compute_dtype: torch.dtype | None = None,
 ) -> BatchedRunOutput:
-    """Run hydrology + reactive transport for K parameter sets as one batch.
+    """Run hydrology + reactive transport for a batch of parameter sets.
 
     Args:
-        params:       (K, num_parameters) flat parameter array: the
+        params:       (batch_size, num_parameters) flat parameter array: the
             hydrological block, the RT zone blocks (one block per flat zone),
             and the init-state section (width and column order per the
             module docstring).
@@ -491,7 +498,7 @@ def run_hydro_rt_batched(
 
     set_hydro_dtype(dtype)
 
-    K: int = int(params.shape[0])
+    batch_size: int = int(params.shape[0])
     num_hydro: int = model_type.get_num_hydro_parameters()
     num_rt_zone: int = model_type.get_num_rt_parameters(zone_configs, network)
     num_react: int = sum(1 for c in zone_configs.values() if c.do_reactions)
@@ -587,11 +594,11 @@ def run_hydro_rt_batched(
     )
 
     # ---- Per-lane outputs ---- #
-    lat_flux: Tensor = hydro["lat_flux"]  # (K, T, Z)
+    lat_flux: Tensor = hydro["lat_flux"]  # (batch_size, T, Z)
     # Per-lane area fractions: each zone inherits the fraction of the surface
     # column it drains (``size_mat @ scales``), mirroring the scalar
     # ``HydrologicalModel.zone_scales``.
-    zone_scales: Tensor = scales @ geometry.size_mat.T  # (K, num_zones)
+    zone_scales: Tensor = scales @ geometry.size_mat.T  # (batch_size, num_zones)
     # Catchment-mean outlet: weight each river zone's lateral outflow by the
     # area fraction of the column it discharges from, so the streamflow is a
     # catchment-mean depth rather than an unweighted sum of zone fluxes
@@ -601,7 +608,7 @@ def run_hydro_rt_batched(
     )
 
     doc_idx: int = int(network.species_names.index("DOC"))
-    river_scales: Tensor = zone_scales[:, geometry.river_ids]  # (K, num_river)
+    river_scales: Tensor = zone_scales[:, geometry.river_ids]  # (batch_size, num_river)
     doc_riv: Tensor = torch.stack(
         [
             _flow_weighted_river_doc(
@@ -624,15 +631,15 @@ def run_hydro_rt_batched(
 
     hydro_objectives: list[dict[str, float]] = []
     rt_doc_objectives: list[dict[str, float]] = []
-    for k in range(K):
+    for lane in range(batch_size):
         hydro_objectives.append(
             {
-                name: float(fn(meas_q, q_sim[k]))
+                name: float(fn(meas_q, q_sim[lane]))
                 for name, fn in HYDRO_OBJECTIVE_FUNCTIONS
             }
         )
         doc_sim: Series = Series(
-            doc_riv[k].detach().cpu().numpy(),
+            doc_riv[lane].detach().cpu().numpy(),
             dtype=float,
             index=doc_meas.index,
         )
@@ -659,12 +666,12 @@ def _flow_weighted_river_doc(
     """Flow-weighted river DOC ``sum_r (q_lat_r / q_sim) * DOC_r`` per lane.
 
     Args:
-        state_t:      ``(K, num_zones, num_species)`` concentrations at one
+        state_t:      ``(batch_size, num_zones, num_species)`` concentrations at one
             step.
-        lat_flux:     ``(K, num_zones)`` internal lateral fluxes at that step.
+        lat_flux:     ``(batch_size, num_zones)`` internal lateral fluxes at that step.
         river_ids:    flat indices of the river zones.
         doc_idx:      index of the DOC species.
-        river_scales: optional ``(K, len(river_ids))`` per-lane area-fraction
+        river_scales: optional ``(batch_size, len(river_ids))`` per-lane area-fraction
             weights for the river zones (``size_mat @ scales`` restricted to
             the river zones).  When given, each river zone's lateral outflow
             is weighted by its lane's area fraction before the mixing
@@ -673,7 +680,7 @@ def _flow_weighted_river_doc(
             weighted streamflow in the fraction).
 
     Returns:
-        ``(K,)`` river DOC concentrations for the step.
+        ``(batch_size,)`` river DOC concentrations for the step.
     """
     if river_scales is not None:
         w: Tensor = lat_flux[:, river_ids] * river_scales
@@ -690,14 +697,15 @@ def _build_hydro_zones(
 ) -> list[HydrologicZone]:
     """Build per-lane :class:`HydrologicZone` objects from batched blocks.
 
-    Each returned zone holds ``(K,)`` parameter tensors so one zone object steps
-    all lanes together.  The ground-zone ``k`` drainage coefficient is unpacked
+    Each returned zone holds ``(batch_size,)`` parameter tensors so one zone
+    object steps all lanes together.  The ground-zone ``k`` drainage coefficient
+    is unpacked
     from its log10 natural scale, matching ``HydrologicZone.from_array`` (and
     therefore ``Model.hydro_from_array`` ``natural_scales=True``).
 
     Args:
         model_type: the hydrology ``Model`` subclass (fixes zone order/types).
-        blocks:     per-flat-zone ``(K, num_parameters)`` blocks (from
+        blocks:     per-flat-zone ``(batch_size, num_parameters)`` blocks (from
             :func:`_hydro_zone_blocks`).
 
     Returns:
@@ -712,8 +720,9 @@ def _build_hydro_zones(
         kwargs: dict[str, Tensor] = {}
         for j, pname in enumerate(ztype.parameter_names()):
             # Clone the block column: ``block[:, j]`` is a *view* of the shared
-            # ``(K, num_parameters)`` block, so give each zone parameter its own
-            # storage (no aliasing of the shared block across zone objects).
+            # ``(batch_size, num_parameters)`` block, so give each zone
+            # parameter its own storage (no aliasing of the shared block across
+            # zone objects).
             col: Tensor = block[:, j].clone()
             if isinstance(proto, (GroundZone, GroundZoneB)) and pname == "k":
                 col = 10.0 ** col
@@ -742,7 +751,7 @@ def _rt_blocks(
         model_type:  the ``Model`` subclass (fixes zone names/order).
         network:     the reaction network (fixes ``num_minerals``).
         zone_configs: per-zone ``(do_reactions, do_speciation)`` flags.
-        arr:         ``(K, num_rt_zone_parameters)`` RT columns.
+        arr:         ``(batch_size, num_rt_zone_parameters)`` RT columns.
         device:      compute device.
         dtype:       compute dtype.
 
@@ -777,7 +786,7 @@ def _init_state_tensor(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Build the ``(K, num_zones, num_species)`` initial RT concentration state.
+    """Build the ``(batch_size, num_zones, num_species)`` initial RT state.
 
     Mirrors the scalar ``Model.run_rt_model`` initial-concentration defaults
     (``model.py``): primary aqueous species start at ``init_aq_conc`` except
@@ -795,7 +804,7 @@ def _init_state_tensor(
         model_type:   the ``Model`` subclass (fixes zone names/order).
         network:      the reaction network (fixes species ordering/sizes).
         zone_configs: per-zone ``(do_reactions, do_speciation)`` flags.
-        arr:          ``(K, num_init_columns)`` init-state columns.
+        arr:          ``(batch_size, num_init_columns)`` init-state columns.
         mean_doc:     observed mean river DOC [mmol/L] (DOC initial conc).
         init_aq_conc: initial concentration of the other primary/secondary
             aqueous species.
@@ -803,15 +812,17 @@ def _init_state_tensor(
         dtype:        compute dtype.
 
     Returns:
-        ``(K, num_zones, num_species)`` initial concentrations.
+        ``(batch_size, num_zones, num_species)`` initial concentrations.
     """
     zone_names: list[str] = model_type.get_zone_names()
-    K: int = int(arr.shape[0])
+    batch_size: int = int(arr.shape[0])
     nz: int = len(zone_names)
     ns: int = network.num_species
     idx: dict[str, int] = {name: i for i, name in enumerate(network.species_names)}
 
-    state: Tensor = torch.full((K, nz, ns), ZERO_CONC, dtype=dtype, device=device)
+    state: Tensor = torch.full(
+        (batch_size, nz, ns), ZERO_CONC, dtype=dtype, device=device
+    )
 
     for prim in network.primary_aqueous:
         col: int = idx[prim.name]
@@ -894,8 +905,8 @@ def _per_lane_forcing(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Distribute the surface forcing to every zone, per lane.
 
-    For each lane ``k`` the per-zone series are ``all_sources @ (size_mat @
-    diag(scales[k])).T``; temperature additionally uses the row-normalized
+    For each lane the per-zone series are ``all_sources @ (size_mat @
+    diag(scales[lane])).T``; temperature additionally uses the row-normalized
     relative matrix (mirrors ``_get_forc_mat(relative=True)``).
 
     Args:
@@ -903,32 +914,41 @@ def _per_lane_forcing(
         all_precip: ``(num_steps, num_surface)`` precip source matrix.
         all_temp:   ``(num_steps, num_surface)`` temperature source matrix.
         all_pet:    ``(num_steps, num_surface)`` PET source matrix.
-        scales:     ``(K, num_surface)`` per-lane surface-zone areas.
+        scales:     ``(batch_size, num_surface)`` per-lane surface-zone areas.
         dtype:      compute dtype.
 
     Returns:
-        ``(zone_precip, zone_temp, zone_pet)`` each ``(K, num_steps, num_zones)``.
+        ``(zone_precip, zone_temp, zone_pet)``, each of shape
+        ``(batch_size, num_steps, num_zones)``.
     """
-    K: int = int(scales.shape[0])
+    batch_size: int = int(scales.shape[0])
     num_steps: int = int(all_precip.shape[0])
     num_zones: int = int(geometry.size_mat.shape[0])
     device: torch.device = all_precip.device
 
-    zone_precip: Tensor = torch.empty(K, num_steps, num_zones, dtype=dtype, device=device)
-    zone_temp: Tensor = torch.empty(K, num_steps, num_zones, dtype=dtype, device=device)
-    zone_pet: Tensor = torch.empty(K, num_steps, num_zones, dtype=dtype, device=device)
+    zone_precip: Tensor = torch.empty(
+        batch_size, num_steps, num_zones, dtype=dtype, device=device
+    )
+    zone_temp: Tensor = torch.empty(
+        batch_size, num_steps, num_zones, dtype=dtype, device=device
+    )
+    zone_pet: Tensor = torch.empty(
+        batch_size, num_steps, num_zones, dtype=dtype, device=device
+    )
 
     eye: Tensor = torch.eye(scales.shape[1], dtype=dtype, device=device)
-    for k in range(K):
-        mat_k: Tensor = geometry.size_mat @ (eye * scales[k])
-        row_sums: Tensor = mat_k.sum(dim=1)
-        relative_mat: Tensor = torch.zeros_like(mat_k)
+    for lane in range(batch_size):
+        mat_lane: Tensor = geometry.size_mat @ (eye * scales[lane])
+        row_sums: Tensor = mat_lane.sum(dim=1)
+        relative_mat: Tensor = torch.zeros_like(mat_lane)
         non_zero: Tensor = row_sums != 0
-        relative_mat[non_zero] = mat_k[non_zero] / row_sums[non_zero].unsqueeze(1)
+        relative_mat[non_zero] = (
+            mat_lane[non_zero] / row_sums[non_zero].unsqueeze(1)
+        )
 
-        zone_precip[k] = all_precip @ mat_k.T
-        zone_temp[k] = all_temp @ relative_mat.T
-        zone_pet[k] = all_pet @ mat_k.T
+        zone_precip[lane] = all_precip @ mat_lane.T
+        zone_temp[lane] = all_temp @ relative_mat.T
+        zone_pet[lane] = all_pet @ mat_lane.T
 
     return zone_precip, zone_temp, zone_pet
 
@@ -955,25 +975,31 @@ def run_hydro_batched(
     Args:
         geometry:    connectivity (``lat_mat`` / ``vert_mat``).
         zones:       per-lane hydrologic zones (flat order).
-        zone_precip: ``(K, num_steps, num_zones)`` per-zone precipitation.
-        zone_temp:   ``(K, num_steps, num_zones)`` per-zone temperature.
-        zone_pet:    ``(K, num_steps, num_zones)`` per-zone PET.
+        zone_precip: ``(batch_size, num_steps, num_zones)`` per-zone precipitation.
+        zone_temp:   ``(batch_size, num_steps, num_zones)`` per-zone temperature.
+        zone_pet:    ``(batch_size, num_steps, num_zones)`` per-zone PET.
         dates:       simulation timestamps (drives the step lengths).
-        init_state:  ``(num_zones,)`` or ``(K, num_zones)`` initial storage.
+        init_state:  ``(num_zones,)`` or ``(batch_size, num_zones)`` initial
+            storage.
         device:      compute device.
         dtype:       compute dtype.
 
     Returns:
-        A dict of ``(K, num_steps, num_zones)`` tensors: ``state``, ``forc_flux``,
-        ``vap_flux``, ``lat_flux``, ``vert_flux``, ``q_in``, ``lat_flux_ext``,
-        ``vert_flux_ext``.
+        A dict of ``(batch_size, num_steps, num_zones)`` tensors: ``state``,
+        ``forc_flux``, ``vap_flux``, ``lat_flux``, ``vert_flux``, ``q_in``,
+        ``lat_flux_ext``, ``vert_flux_ext``.
     """
-    K: int = int(zone_precip.shape[0])
+    batch_size: int = int(zone_precip.shape[0])
     num_steps: int = int(zone_precip.shape[1])
     num_zones: int = int(zone_precip.shape[2])
 
     if init_state.dim() == 1:
-        state: Tensor = init_state.to(dtype=dtype, device=device).unsqueeze(0).expand(K, -1).clone()
+        state: Tensor = (
+            init_state.to(dtype=dtype, device=device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .clone()
+        )
     else:
         state = init_state.to(dtype=dtype, device=device).clone()
 
@@ -984,18 +1010,20 @@ def run_hydro_batched(
     lat_mat: Tensor = geometry.lat_mat.to(dtype=dtype, device=device)
     vert_mat: Tensor = geometry.vert_mat.to(dtype=dtype, device=device)
 
-    # Phase 3.1: pre-allocated per-(k, t, zone) output slabs, matching the
-    # original ``torch.stack`` layout (the per-zone list was stacked with
-    # ``dim=1`` into ``(K, Z)`` per step and the per-step slabs with ``dim=1``
-    # into ``(K, T, Z)``, so the leading axis is the batch lane).  The step
-    # loop writes straight into ``out_*[:, t, i]`` instead of appending
-    # per-zone tensors to Python lists and ``torch.stack``ing them (8 stacks
-    # /step plus the per-zone ``q_in`` matvec rebuilds).  The per-step
-    # zone-export accumulators are two dense ``(num_zones, K)`` buffers, so
-    # the upstream ``q_in`` is a single matvec against a slice — no list, no
-    # ``torch.stack``.
+    # Phase 3.1: pre-allocated per-(lane, step, zone) output slabs, matching
+    # the original ``torch.stack`` layout (the per-zone list was stacked with
+    # ``dim=1`` into ``(batch_size, Z)`` per step and the per-step slabs with
+    # ``dim=1`` into ``(batch_size, T, Z)``, so the leading axis is the batch
+    # lane).  The step loop writes straight into ``out_*[:, t, i]`` instead of
+    # appending per-zone tensors to Python lists and ``torch.stack``ing them
+    # (8 stacks /step plus the per-zone ``q_in`` matvec rebuilds).  The
+    # per-step zone-export accumulators are two dense ``(num_zones,
+    # batch_size)`` buffers, so the upstream ``q_in`` is a single matvec
+    # against a slice — no list, no ``torch.stack``.
     def _out() -> Tensor:
-        return torch.empty(K, num_steps, num_zones, dtype=dtype, device=device)
+        return torch.empty(
+            batch_size, num_steps, num_zones, dtype=dtype, device=device
+        )
 
     out_state: Tensor = _out()
     out_forc: Tensor = _out()
@@ -1005,8 +1033,12 @@ def run_hydro_batched(
     out_qin: Tensor = _out()
     out_lat_ext: Tensor = _out()
     out_vert_ext: Tensor = _out()
-    lat_ext_step: Tensor = torch.empty(num_zones, K, dtype=dtype, device=device)
-    vert_ext_step: Tensor = torch.empty(num_zones, K, dtype=dtype, device=device)
+    lat_ext_step: Tensor = torch.empty(
+        num_zones, batch_size, dtype=dtype, device=device
+    )
+    vert_ext_step: Tensor = torch.empty(
+        num_zones, batch_size, dtype=dtype, device=device
+    )
 
     for t in range(num_steps):
         dt: float = delta_ts[t]
@@ -1014,14 +1046,14 @@ def run_hydro_batched(
         for i in range(num_zones):
             if i > 0:
                 # Sum over the already-solved upstream zones: a single dense
-                # matvec (``lat_ext_step[:i]`` is ``(i, K)``) replaces the old
+                # matvec (``lat_ext_step[:i]`` is ``(i, batch_size)``) replaces the old
                 # ``torch.stack(accum[:i])`` + reshape.
                 q_in: Tensor = (
                     lat_ext_step[:i].transpose(0, 1) @ lat_mat[i, :i]
                     + vert_ext_step[:i].transpose(0, 1) @ vert_mat[i, :i]
                 )
             else:
-                q_in = torch.zeros(K, dtype=dtype, device=device)
+                q_in = torch.zeros(batch_size, dtype=dtype, device=device)
 
             d: HydroForcing = HydroForcing(
                 precip=zone_precip[:, t, i],
@@ -1076,19 +1108,19 @@ def _hydro_zone_blocks(
     The hydrological section of a parameter vector stacks every zone's
     ``num_parameters()`` values in flat (structure) order, followed by the
     ``num_surface - 1`` relative-proportion columns.  Each zone block is kept
-    as a ``(K, num_parameters)`` tensor (raw, log10 scales intact); the
-    proportions are recombined into a ``(K, num_surface)`` per-lane scale
+    as a ``(batch_size, num_parameters)`` tensor (raw, log10 scales intact); the
+    proportions are recombined into a ``(batch_size, num_surface)`` per-lane scale
     vector whose last column is ``1 - sum(others)``.
 
     Args:
         model_type: the hydrology ``Model`` subclass (fixes the layout).
-        arr:        ``(K, num_hydro_parameters)`` hydrological columns.
+        arr:        ``(batch_size, num_hydro_parameters)`` hydrological columns.
         device:     compute device.
         dtype:      compute dtype.
 
     Returns:
-        ``(blocks, scales)`` where ``blocks[i]`` is the ``(K, num_parameters)``
-        block of the ``i``-th flat zone and ``scales`` is ``(K, num_surface)``.
+        ``(blocks, scales)`` where ``blocks[i]`` is the ``(batch_size, num_parameters)``
+        block of the ``i``-th flat zone and ``scales`` is ``(batch_size, num_surface)``.
     """
     num_zone_params: int = model_type.get_num_zone_parameters()
     num_size_params: int = model_type.get_num_size_parameters()

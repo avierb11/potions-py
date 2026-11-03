@@ -561,35 +561,37 @@ class MineralParameters:
     def from_batched_array(
         arr: Tensor, natural_scales: bool = True
     ) -> MineralParameters:
-        """Build per-lane mineral parameters from a ``[K, 4*num_min]`` array.
+        """Build per-lane mineral parameters from a ``[batch_size, 4*num_min]`` array.
 
         Unlike :meth:`from_array` (a single ``[4*num_min]`` lane, producing
         ``[num_min]`` fields), this treats every row as an *independent*
-        parameter lane so that a batch of ``K`` parameter sets can be stepped in
-        one pass.  Each field carries a leading ``K`` batch dimension:
+        parameter lane so that a batch of parameter sets can be stepped in one
+        pass.  Each field carries a leading batch-size dimension:
 
-        - ``sw_threshold`` / ``sw_exp`` / ``q_10`` / ``ssa``: ``[K, num_min]``.
+        - ``sw_threshold`` / ``sw_exp`` / ``q_10`` / ``ssa``:
+          ``[batch_size, num_min]``.
 
         The fields are laid out per row in the same interleaved order as the
         scalar form ``(sw_threshold, sw_exp, q_10, ssa)`` per mineral; ``10**``
         is applied to ``ssa`` when ``natural_scales`` is true.
 
         Args:
-            arr:            ``[K, PARAMETERS_PER_MINERAL * num_min]`` packed array.
+            arr:            ``[batch_size, PARAMETERS_PER_MINERAL * num_min]``
+                packed array.
             natural_scales: if True, the packed ``ssa`` values are log10 and are
                 re-exponentiated on unpacking.
 
         Returns:
             A :class:`MineralParameters` whose four fields each have shape
-            ``(K, num_min)``.
+            ``(batch_size, num_min)``.
         """
         if arr.ndim != 2 or arr.shape[1] % PARAMETERS_PER_MINERAL != 0:
             raise ValueError(
                 "Failed to create batched MineralParameters from array because "
-                f"the shape is wrong, expected [K, multiple of "
+                f"the shape is wrong, expected [batch_size, multiple of "
                 f"{PARAMETERS_PER_MINERAL}] but got {tuple(arr.shape)}"
             )
-        g0: Tensor = arr[..., 0::PARAMETERS_PER_MINERAL]  # [K, num_min]
+        g0: Tensor = arr[..., 0::PARAMETERS_PER_MINERAL]  # [batch_size, num_min]
         g1: Tensor = arr[..., 1::PARAMETERS_PER_MINERAL]
         g2: Tensor = arr[..., 2::PARAMETERS_PER_MINERAL]
         g3: Tensor = arr[..., 3::PARAMETERS_PER_MINERAL]
@@ -647,29 +649,32 @@ class RtParameters:
     def from_batched_array(
         arr: Tensor, natural_scales: bool = True
     ) -> RtParameters:
-        """Build per-lane :class:`RtParameters` from a ``[K, 3 + 4*num_min]`` array.
+        """Build per-lane :class:`RtParameters` from a batched array.
 
-        The first three columns of every row are the zone dimensions
-        (porosity, depth, passive water storage); the trailing
-        ``4*num_min`` columns are the per-mineral kinetic blocks in the same
-        interleaved ``(sw_threshold, sw_exp, q_10, ssa)`` order as the scalar form.
-        Every field carries a leading ``K`` batch dimension so a batch of ``K``
-        parameter sets can drive a single ``RtZone.step`` call.
+        The input has shape ``[batch_size, 3 + 4*num_min]``.  The first three
+        columns of every row are the zone dimensions (porosity, depth, passive
+        water storage); the trailing ``4*num_min`` columns are the per-mineral
+        kinetic blocks in the same interleaved
+        ``(sw_threshold, sw_exp, q_10, ssa)`` order as the scalar form.  Every
+        field carries a leading batch-size dimension so a batch of parameter
+        sets can drive a single ``RtZone.step`` call.
 
         Args:
-            arr:            ``[K, 3 + PARAMETERS_PER_MINERAL*num_min]`` per-lane array.
+            arr:            ``[batch_size, 3 + PARAMETERS_PER_MINERAL*num_min]``
+                per-lane array.
             natural_scales: if True, the packed ``ssa`` values are log10 and are
                 re-exponentiated on unpacking.
 
         Returns:
-            A :class:`RtParameters` whose :attr:`dimensions` fields are ``(K,)``
-            tensors and whose :attr:`mineral_params` (if reactions are enabled)
-            has ``(K, num_min)`` fields.
+            A :class:`RtParameters` whose :attr:`dimensions` fields are
+            ``(batch_size,)`` tensors and whose :attr:`mineral_params` (if
+            reactions are enabled) has ``(batch_size, num_min)`` fields.
         """
         if arr.ndim != 2 or arr.shape[1] < 3:
             raise ValueError(
                 "Failed to create batched RtParameters from array because the "
-                f"shape is wrong, expected [K, 3 + multiple of 4] but got {tuple(arr.shape)}"
+                "shape is wrong, expected [batch_size, 3 + multiple of 4] "
+                f"but got {tuple(arr.shape)}"
             )
         dims: ZoneDimensions = ZoneDimensions(
             porosity=arr[:, 0].clone(),

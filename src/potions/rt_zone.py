@@ -2268,19 +2268,24 @@ class RtZone:
 
         Identical to :meth:`step` but the mineral auxiliary parameters
         ``aux`` and the zone ``depth`` are supplied explicitly, so one zone
-        object can drive ``K`` independent parameter sets in a single batched
-        call (each lane uses its own depth / soil-water-specific surface area).
-        The shared network (monod / TST / equilibrium / misc) and the per-zone,
-        cross-lane speciation warm-start are reused from the instance.
+        object can drive a batch of independent parameter sets in a single
+        batched call (each lane uses its own depth / soil-water-specific
+        surface area).  The shared network (monod / TST / equilibrium / misc)
+        and the per-zone, cross-lane speciation warm-start are reused from the
+        instance.
 
         Args:
-            c_0:     (num_spec,) or (K, num_spec) initial concentrations.
+            c_0:     (num_spec,) or (batch_size, num_spec) initial
+                concentrations.
             d:       reactive-transport forcing for this step/zone (fields may
-                be ``(K,)`` / ``(K, num_spec)`` tensors for batched lanes).
+                be ``(batch_size,)`` / ``(batch_size, num_spec)`` tensors for
+                batched lanes).
             dt_days: time step length [days].
-            aux:     per-lane mineral auxiliary parameters (``(K, num_min)``
-                fields) or ``None`` when reactions are disabled for the zone.
-            depth:   per-lane zone depth [mm] (scalar or ``(K,)`` tensor).
+            aux:     per-lane mineral auxiliary parameters
+                (``(batch_size, num_min)`` fields) or ``None`` when reactions
+                are disabled for the zone.
+            depth:   per-lane zone depth [mm] (scalar or ``(batch_size,)``
+                tensor).
             verbose: print solver progress.
             compute_dtype: Optional dtype for the RT solve internals (e.g.,
                 float32 compute with float64 convergence checks).

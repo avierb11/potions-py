@@ -1,6 +1,6 @@
 """Throughput benchmark for the East River big-network batched runner.
 
-Measures *model evaluations per second* of the batched K-lane runner
+Measures *model evaluations per second* of the batched multi-lane runner
 ``potions.model_batched.run_hydro_rt_batched`` for the large-network East
 River case: the lateral three-layer structure (6 zones) with the 11-species
 SOC / SOC-lz / calcite / XDOC network, over the full 3287-day record
@@ -10,26 +10,26 @@ defined for the full machine.
 
 A *model evaluation* is one full forward run — hydrology plus reactive
 transport over the whole record — of the model for one parameter vector.
-Batch size K means the batched runner carries K such evaluations in one
-computation; following the convention of ``bench_full_record.py``, the K
-copies are *identical* on purpose, so the measurement is about throughput,
-not about parameter diversity.
+A *batch size* of N means the batched runner carries N such evaluations in
+one computation, one per lane; following the convention of
+``bench_full_record.py``, the copies are *identical* on purpose, so the
+measurement is about throughput, not about parameter diversity.
 
 For each batch size the script times one full ``run_hydro_rt_batched``
 call and reports:
 
-- wall time for the whole K-lane run
-- model evaluations per second (K / wall time)
-- zones solved per second and days simulated per second (K-lane totals)
+- wall time for the whole batch
+- model evaluations per second (batch size / wall time)
+- zones solved per second and days simulated per second (batch-wide totals)
 - wall time per single evaluation and per simulated day
 - peak memory footprint (resident set size)
 - output sanity: finite values, mean discharge, overflow lanes
 
 The batched runner also scores per-lane objective functions after the
-forward pass (a small Python/pandas loop that scales linearly in K).  The
-script times that scoring step on lane 0 after each run and reports the
-estimated total, so the headline evaluations/s can be attributed between
-the batched simulation and the per-lane scoring.
+forward pass (a small Python/pandas loop that scales linearly with the batch
+size).  The script times that scoring step on lane 0 after each run and
+reports the estimated total, so the headline evaluations/s can be attributed
+between the batched simulation and the per-lane scoring.
 
 Usage (from the repository root)::
 
@@ -175,8 +175,9 @@ def measure_scoring_overhead(
 
     The batched runner, after the forward pass, scores each lane's streamflow
     and river DOC with the standard objective functions in a Python loop;
-    this replicates that loop for lane 0 so the K-linear scoring cost can be
-    separated from the batched simulation cost.
+    this replicates that loop for lane 0 so the scoring cost that grows
+    linearly with the batch size can be separated from the batched simulation
+    cost.
     """
     doc_meas: Series = config["conc_df"]["DOC"]
     q_meas: Series = config["q_meas"]
@@ -197,23 +198,24 @@ def measure_scoring_overhead(
 def run_batch(
     one: NDArray[np.float64],
     config: BatchedConfig,
-    K: int,
+    batch_size: int,
     num_days: int,
     num_zones: int,
 ) -> dict[str, float]:
-    """Run the batched runner once for K identical copies and time it.
+    """Run the batched runner once for ``batch_size`` identical copies and time it.
 
     Args:
         one: the single flat batched parameter vector.
         config: the batched config.
-        K: batch size (number of identical evaluations carried together).
+        batch_size: number of identical evaluations carried together, one per
+            lane.
         num_days: length of the record in days.
         num_zones: number of model zones.
 
     Returns:
         Measured statistics for the run (see the printed table).
     """
-    batch: NDArray[np.float64] = np.tile(one, (K, 1))
+    batch: NDArray[np.float64] = np.tile(one, (batch_size, 1))
     t0: float = time.perf_counter()
     out: BatchedRunOutput = run_hydro_rt_batched(
         batch,
@@ -227,15 +229,15 @@ def run_batch(
     q: torch.Tensor = out.q_sim
     doc: torch.Tensor = out.doc_riv
     return {
-        "K": K,
+        "batch_size": batch_size,
         "time_s": elapsed,
-        "evals_per_s": K / elapsed,
-        "zones_per_s": K * num_days * num_zones / elapsed,
-        "days_per_s": K * num_days / elapsed,
-        "s_per_eval": elapsed / K,
+        "evals_per_s": batch_size / elapsed,
+        "zones_per_s": batch_size * num_days * num_zones / elapsed,
+        "days_per_s": batch_size * num_days / elapsed,
+        "s_per_eval": elapsed / batch_size,
         "s_per_day": elapsed / num_days,
         "peak_mib": peak_rss_mib(),
-        "scoring_s": scoring_per_lane * K,
+        "scoring_s": scoring_per_lane * batch_size,
         "finite_q": bool(torch.isfinite(q).all()),
         "finite_doc": bool(torch.isfinite(doc).all()),
         "mean_q": float(q.mean()),
@@ -271,7 +273,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--params",
         type=Path,
         default=DEFAULT_PARAMS_CSV,
-        help="showcase final_params.csv to remap (default: %(default)s)",
+        help="parameter CSV to remap (default: %(default)s)",
     )
     parser.add_argument(
         "--batch-sizes",
@@ -293,7 +295,7 @@ def print_row(r: dict[str, float]) -> None:
     """Print one batch-size result row (aligned with the printed header)."""
     ok: str = "ok" if (r["finite_q"] and r["finite_doc"]) else "NOT-FINITE"
     print(
-        f"  K={int(r['K']):5d}  time={r['time_s']:8.1f}s  "
+        f"  batch_size={int(r['batch_size']):5d}  time={r['time_s']:8.1f}s  "
         f"evals/s={r['evals_per_s']:9.4f}  zones/s={r['zones_per_s']:10.1f}  "
         f"days/s={r['days_per_s']:7.3f}  s/eval={r['s_per_eval']:7.2f}  "
         f"s/day={r['s_per_day']:8.4f}  peak={r['peak_mib']:7.0f}MiB  "
@@ -365,25 +367,26 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[4/4] Batched runs on CPU (all {_ALL_CORES} cores, float64)")
     print(
-        f"  {'K':>5s}  {'time':>9s}  {'evals/s':>9s}  {'zones/s':>10s}  "
+        f"  {'batch_size':>16s}  {'time':>9s}  {'evals/s':>9s}  {'zones/s':>10s}  "
         f"{'days/s':>7s}  {'s/eval':>7s}  {'s/day':>8s}  {'peak':>9s}  "
         f"{'mean_q':>7s}  {'overflow':>8s}  status"
     )
     results: list[dict[str, float]] = []
-    for K in batch_sizes:
-        print(f"  batch K={K} ...", flush=True)
-        r: dict[str, float] = run_batch(one, config, K, num_days, num_zones)
+    for batch_size in batch_sizes:
+        print(f"  batch_size={batch_size} ...", flush=True)
+        r: dict[str, float] = run_batch(one, config, batch_size, num_days, num_zones)
         print_row(r)
         results.append(r)
 
-    print("\nSummary (model evaluations per second, K identical copies):")
+    print("\nSummary (model evaluations per second, identical copies):")
     for r in results:
         sim_only: float = r["time_s"] - r["scoring_s"]
         forward_evals: float = (
-            r["K"] / sim_only if sim_only > 0.0 else float("nan")
+            r["batch_size"] / sim_only if sim_only > 0.0 else float("nan")
         )
         print(
-            f"  K={int(r['K']):5d}: {r['evals_per_s']:.4f} evals/s overall; "
+            f"  batch_size={int(r['batch_size']):5d}: "
+            f"{r['evals_per_s']:.4f} evals/s overall; "
             f"forward-only estimate {forward_evals:.4f} evals/s "
             f"(one evaluation = {num_days} days x {num_zones} zones)"
         )

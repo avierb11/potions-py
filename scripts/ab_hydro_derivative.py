@@ -1,7 +1,8 @@
 """A/B check: analytic hydro derivative vs the legacy autograd path.
 
-Runs the full East River record (K=1, float64, single thread) **twice** with
-identical forcing / parameters and compares the results bit-for-bit
+Runs the full East River record (batch size 1, float64, single thread)
+**twice** with identical forcing / parameters and compares the results
+bit-for-bit
 (NaN-aware: a lane matches when the values are equal or both NaN):
 
 1. **analytic** — the current code: ``HydrologicZone.step`` feeds the damped
@@ -104,11 +105,11 @@ def _report(name: str, a: torch.Tensor, b: torch.Tensor) -> int:
     return n
 
 
-def build_hydro_inputs(K: int) -> HydroInputs:
+def build_hydro_inputs(batch_size: int) -> HydroInputs:
     """Rebuild the exact hydro inputs ``run_hydro_rt_batched`` would build.
 
-    Mirrors the setup block of ``model_batched.run_hydro_rt_batched`` (K
-    identical midpoint parameter sets) so the A/B runs feed
+    Mirrors the setup block of ``model_batched.run_hydro_rt_batched`` (that
+    many identical midpoint parameter sets) so the A/B runs feed
     ``run_hydro_batched`` the same zones / geometry / forcing as the
     production call.
     """
@@ -118,7 +119,7 @@ def build_hydro_inputs(K: int) -> HydroInputs:
     model_type = pt.HbvLateralModel
     names, midpoints = bench.default_parameter_vector()
     config, window = bench.build_config()
-    params: NDArray[np.float64] = bench.make_params(K, names, midpoints)
+    params: NDArray[np.float64] = bench.make_params(batch_size, names, midpoints)
 
     num_hydro: int = model_type.get_num_hydro_parameters()
     hydro_arr: NDArray[np.float64] = params[:, :num_hydro]
@@ -227,12 +228,18 @@ def run_hydro_once(
     return out, wall
 
 
-def run_full_once(mode: str, config: object, K: int, device: torch.device, dtype: torch.dtype) -> tuple[object, float]:
+def run_full_once(
+    mode: str,
+    config: object,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[object, float]:
     """Run the full hydro + RT pipeline once in the given derivative mode."""
     _set_mode(mode)
     t0: float = time.perf_counter()
     out = run_hydro_rt_batched(
-        bench.make_params(K, *bench.default_parameter_vector()),
+        bench.make_params(batch_size, *bench.default_parameter_vector()),
         config,  # type: ignore[arg-type]
         device,
         dtype,
@@ -243,9 +250,12 @@ def run_full_once(mode: str, config: object, K: int, device: torch.device, dtype
 
 def main() -> int:
     torch.set_num_threads(1)
-    K: int = 1
+    batch_size: int = 1
     print("=" * 84)
-    print(f"A/B: analytic hydro derivative vs legacy autograd path (K={K}, f64, 1 thread)")
+    print(
+        "A/B: analytic hydro derivative vs legacy autograd path "
+        f"(batch size {batch_size}, f64, 1 thread)"
+    )
     print("=" * 84)
 
     (
@@ -259,7 +269,7 @@ def main() -> int:
         device,
         dtype,
         geometry,
-    ) = build_hydro_inputs(K)
+    ) = build_hydro_inputs(batch_size)
     T: int = int(zone_precip.shape[1])
     Z: int = int(zone_precip.shape[2])
     print(f"  record: {window[0]:%Y-%m-%d} .. {window[-1]:%Y-%m-%d}  ({T} days, {Z} zones)")
@@ -287,8 +297,8 @@ def main() -> int:
 
     # ---------------- full-record A/B ---------------- #
     print("[2] full record: q_sim / doc_riv / overflow (analytic vs autograd driver)")
-    out_a, wall_fa = run_full_once("analytic", config, K, device, dtype)
-    out_g, wall_fg = run_full_once("autograd", config, K, device, dtype)
+    out_a, wall_fa = run_full_once("analytic", config, batch_size, device, dtype)
+    out_g, wall_fg = run_full_once("autograd", config, batch_size, device, dtype)
     print(f"  wall: analytic={wall_fa:.2f}s ({wall_fa / T * 1000:.3f} ms/day)   "
           f"autograd={wall_fg:.2f}s ({wall_fg / T * 1000:.3f} ms/day)")
 

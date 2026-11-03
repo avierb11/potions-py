@@ -1,5 +1,10 @@
 # potions-py — Progress Log
 
+> **Terminology note:** in historical entries below, `K` denotes the batch
+> size — the number of identical parameter sets (lanes) advanced together in
+> one batched call. Current code and scripts use the explicit name
+> `batch_size`.
+
 ## Session 1 (analysis + plan)
 - [x] Explored old project (Rust core in `rust/src/`, Python layer in `src/potions`).
 - [x] Plan written (PLAN.md, superseded by IMPLEMENTATION_PLAN.md where they conflict).

@@ -901,7 +901,7 @@ def _build_context(args: argparse.Namespace) -> dict[str, object]:
     surface_index: int = int(geo_model.surface_zone_ids[0])
     surface_zone: HydrologicZone = zones[surface_index]
 
-    # Real per-day forcing for the probe zone (``(1, T, Z)``; K=1 here).
+    # Real per-day forcing for the probe zone (``(1, T, Z)``; batch size 1 here).
     geometry: Geometry = Geometry(
         lat_mat=geo_model.lat_mat.to(dtype=dtype, device=device),
         vert_mat=geo_model.vert_mat.to(dtype=dtype, device=device),

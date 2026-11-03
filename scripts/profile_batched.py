@@ -1,10 +1,10 @@
-"""Profiling script for the batched ``K``-lane East River runner.
+"""Profiling script for the batched multi-lane East River runner.
 
 Measures end-to-end wall time of :func:`potions.run_hydro_rt_batched` over a
-ladder of lane counts ``K`` (1, 2, 4, ..., ``--kmax``, default hundreds) against
-the **full East River record** (all water years, ~2557 days) and reports the
-throughput in **simulations/sec** at each batch size.  Use ``--start``/``--end``
-or ``--days`` to target a sub-window instead.
+ladder of batch sizes (1, 2, 4, ..., ``--max-batch-size``, default hundreds)
+against the **full East River record** (all water years, ~2557 days) and
+reports the throughput in **simulations/sec** at each batch size.  Use
+``--start``/``--end`` or ``--days`` to target a sub-window instead.
 
 Run on CUDA with float32 by default (the project precision policy in
 ``potions.device``); pass ``--device cpu`` for the float64 CPU path.  The
@@ -15,11 +15,11 @@ without dominating the benchmark.
 
 Usage::
 
-    python scripts/profile_batched.py                    # GPU f32, K ladder to 256
-    python scripts/profile_batched.py --kmax 512         # even deeper ladder
-    python scripts/profile_batched.py --device cpu       # CPU f64 configuration
-    python scripts/profile_batched.py --profile-k 256    # cProfile a K=256 run
-    python scripts/profile_batched.py --out times.csv    # save the table
+    python scripts/profile_batched.py                     # GPU f32, batch sizes to 256
+    python scripts/profile_batched.py --max-batch-size 512  # deeper ladder
+    python scripts/profile_batched.py --device cpu        # CPU f64 configuration
+    python scripts/profile_batched.py --profile-batch-size 256  # cProfile one size
+    python scripts/profile_batched.py --out times.csv     # save the table
 
 Parameter lanes are drawn from the inner 60% of every bound (the same
 ``aim_mid`` sampling as ``parity_check_batched.py``) so lanes stay clear of the
@@ -97,8 +97,10 @@ def load_bounds() -> dict[str, tuple[float, float]]:
     return inputs.bounds
 
 
-def aim_mid(k: int, bounds: dict[str, tuple[float, float]]) -> np.ndarray:
-    """Draw ``k`` parameter vectors inside the inner 60% of every bound."""
+def aim_mid(
+    num_lanes: int, bounds: dict[str, tuple[float, float]]
+) -> np.ndarray:
+    """Draw ``num_lanes`` parameter vectors inside the inner 60% of every bound."""
     out: list[float] = []
     for nm in bounds:
         lo: float
@@ -106,14 +108,16 @@ def aim_mid(k: int, bounds: dict[str, tuple[float, float]]) -> np.ndarray:
         lo, hi = bounds[nm]
         span: float = hi - lo
         out.append(float(np.random.uniform(lo + 0.2 * span, lo + 0.8 * span)))
-    return np.stack([np.asarray(out, dtype=float) for _ in range(k)], axis=0)
+    return np.stack(
+        [np.asarray(out, dtype=float) for _ in range(num_lanes)], axis=0
+    )
 
 
 @dataclass(frozen=True)
 class Timing:
-    """Wall-time measurement for one lane count."""
+    """Wall-time measurement for one batch size."""
 
-    k: int
+    batch_size: int
     batched_best: float
     batched_median: float
     scalar: float
@@ -166,28 +170,37 @@ def time_batched(
 def time_scalar(params: np.ndarray, cfg: BatchedConfig) -> float:
     """Run ``arr_to_results`` lane-by-lane; return total wall seconds."""
     t0: float = time.perf_counter()
-    for k in range(int(params.shape[0])):
-        res = arr_to_results(params[k], cfg, hydro_criteria=None, verbose=False)  # type: ignore[arg-type]
+    for lane in range(int(params.shape[0])):
+        res = arr_to_results(  # type: ignore[arg-type]
+            params[lane], cfg, hydro_criteria=None, verbose=False
+        )
         if isinstance(res, pt.HydroModelResults):
-            print(f"      lane {k}: hydrology-only result (no RT completion)")
+            print(f"      lane {lane}: hydrology-only result (no RT completion)")
     return time.perf_counter() - t0
 
 
-def build_ladder(kmax: int) -> list[int]:
-    """Lane counts to profile: 1, 2, 4, ..., kmax."""
+def build_ladder(max_batch_size: int) -> list[int]:
+    """Batch sizes to profile: 1, 2, 4, ..., ``max_batch_size``."""
     out: list[int] = []
-    k: int = 1
-    while k <= kmax:
-        out.append(k)
-        k *= 2
+    batch_size: int = 1
+    while batch_size <= max_batch_size:
+        out.append(batch_size)
+        batch_size *= 2
     return out
 
 
-def profile_single_k(
-    k: int, params: np.ndarray, cfg: BatchedConfig, device: torch.device, dtype: torch.dtype
+def profile_single_batch_size(
+    batch_size: int,
+    params: np.ndarray,
+    cfg: BatchedConfig,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> None:
     """cProfile one batched run and print the cumulative-time report."""
-    print(f"\n== cProfile of batched K={k} ({device}/{dtype}) (top 30 cumulative) ==")
+    print(
+        f"\n== cProfile of batched batch_size={batch_size} "
+        f"({device}/{dtype}) (top 30 cumulative) =="
+    )
     pr: cProfile.Profile = cProfile.Profile()
     pr.enable()
     pt.run_hydro_rt_batched(params, cfg, device, dtype)
@@ -200,17 +213,19 @@ def profile_single_k(
 def format_table(timings: list[Timing]) -> str:
     """Render the timing table as monospace text."""
     header: str = (
-        f"{'K':>3}  {'wall (s)':>10}  {'sims/s':>10}  {'per-sim (ms)':>12}  "
-        f"{'scalar (s)':>11}  {'speedup':>8}  {'ovf':>4}"
+        f"{'batch_size':>10}  {'wall (s)':>10}  {'sims/s':>10}  "
+        f"{'per-sim (ms)':>12}  {'scalar (s)':>11}  {'speedup':>8}  {'ovf':>4}"
     )
     lines: list[str] = [header, "-" * len(header)]
     for t in timings:
-        throughput: float = t.k / t.batched_median
-        per_sim_ms: float = 1000.0 * t.batched_median / t.k
+        throughput: float = t.batch_size / t.batched_median
+        per_sim_ms: float = 1000.0 * t.batched_median / t.batch_size
         scalar_txt: str = f"{t.scalar:>11.4f}" if t.scalar else f"{'--':>11}"
-        speedup_txt: str = f"{t.scalar / t.batched_median:>8.2f}" if t.scalar else f"{'--':>8}"
+        speedup_txt: str = (
+            f"{t.scalar / t.batched_median:>8.2f}" if t.scalar else f"{'--':>8}"
+        )
         lines.append(
-            f"{t.k:>3}  {t.batched_median:>10.3f}  {throughput:>10.2f}  "
+            f"{t.batch_size:>10}  {t.batched_median:>10.3f}  {throughput:>10.2f}  "
             f"{per_sim_ms:>12.2f}  {scalar_txt}  {speedup_txt}  {t.overflow:>4}"
         )
     return "\n".join(lines)
@@ -238,7 +253,7 @@ def resolve_device(args: argparse.Namespace) -> tuple[torch.device, torch.dtype]
 
 
 def run(args: argparse.Namespace) -> int:
-    """Build config, sample lanes, time the K ladder and print results."""
+    """Build config, sample lanes, time each batch size and print results."""
     device: torch.device
     dtype: torch.dtype
     device, dtype = resolve_device(args)
@@ -254,10 +269,12 @@ def run(args: argparse.Namespace) -> int:
     np.random.seed(args.seed)
 
     ladder: list[int] = (
-        [int(s) for s in args.sizes.split(",")] if args.sizes else build_ladder(args.kmax)
+        [int(s) for s in args.sizes.split(",")]
+        if args.sizes
+        else build_ladder(args.max_batch_size)
     )
-    # One shared lane pool per K (drawn once per K so lane identity is stable).
-    lanes_pool: np.ndarray = aim_mid(args.kmax, load_bounds())
+    # One shared lane pool per batch size, so lane identity is stable.
+    lanes_pool: np.ndarray = aim_mid(args.max_batch_size, load_bounds())
 
     # Warm the runtime (CUDA context / cuBLAS handles / kernel caches) once.
     warmup(lanes_pool[:8], cfg, device, dtype)
@@ -265,18 +282,31 @@ def run(args: argparse.Namespace) -> int:
 
     print("\n== Timing ==")
     timings: list[Timing] = []
-    for k in ladder:
-        params: np.ndarray = lanes_pool[:k]
-        best, median, overflow = time_batched(params, cfg, args.reps, device, dtype)
+    for batch_size in ladder:
+        params: np.ndarray = lanes_pool[:batch_size]
+        best, median, overflow = time_batched(
+            params, cfg, args.reps, device, dtype
+        )
         scalar: float = 0.0
-        if args.full_scalar or (args.scalar_lanes is not None and k <= args.scalar_lanes):
+        if args.full_scalar or (
+            args.scalar_lanes is not None
+            and batch_size <= args.scalar_lanes
+        ):
             scalar = time_scalar(params, cfg)
         timings.append(
-            Timing(k=k, batched_best=best, batched_median=median, scalar=scalar, overflow=overflow)
+            Timing(
+                batch_size=batch_size,
+                batched_best=best,
+                batched_median=median,
+                scalar=scalar,
+                overflow=overflow,
+            )
         )
         ovf_note: str = f"  overflow={overflow}" if overflow else ""
         print(
-            f"   K={k:>3}:  median={median:.3f}s  {k / median:>8.2f} sims/s  "
+            f"   batch_size={batch_size:>3}:  "
+            f"median={median:.3f}s  "
+            f"{batch_size / median:>8.2f} sims/s  "
             f"(best {best:.3f}s)  scalar={scalar:.4f}s{ovf_note}"
         )
 
@@ -285,12 +315,12 @@ def run(args: argparse.Namespace) -> int:
     if args.out:
         rows: list[dict[str, Any]] = [
             {
-                "k": t.k,
+                "batch_size": t.batch_size,
                 "batched_best_s": t.batched_best,
                 "batched_median_s": t.batched_median,
                 "scalar_s": t.scalar,
-                "per_lane_ms": 1000.0 * t.batched_best / t.k,
-                "throughput_lanes_per_s": t.k / t.batched_best,
+                "per_lane_ms": 1000.0 * t.batched_best / t.batch_size,
+                "throughput_lanes_per_s": t.batch_size / t.batched_best,
                 "overflow": t.overflow,
             }
             for t in timings
@@ -298,9 +328,11 @@ def run(args: argparse.Namespace) -> int:
         DataFrame(rows).to_csv(args.out, index=False)
         print(f"\n   table saved: {args.out}")
 
-    if args.profile_k is not None:
-        params: np.ndarray = lanes_pool[: args.profile_k]
-        profile_single_k(args.profile_k, params, cfg, device, dtype)
+    if args.profile_batch_size is not None:
+        params: np.ndarray = lanes_pool[: args.profile_batch_size]
+        profile_single_batch_size(
+            args.profile_batch_size, params, cfg, device, dtype
+        )
 
     return 0
 
@@ -308,7 +340,7 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Profile the batched K-lane East River runner."
+        description="Profile the batched multi-lane East River runner."
     )
     parser.add_argument(
         "--device",
@@ -325,13 +357,26 @@ def main() -> int:
         help="dtype policy: auto = f32 on cuda, f64 on cpu (project default)",
     )
     parser.add_argument(
-        "--sizes", type=str, default=None,
-        help="comma-separated K ladder (overrides --kmax); e.g. 32,256"
+        "--sizes",
+        type=str,
+        default=None,
+        help="comma-separated batch sizes (overrides --max-batch-size); "
+        "e.g. 32,256",
     )
     parser.add_argument(
-        "--kmax", type=int, default=256, help="largest lane count (power of 2)"
+        "--max-batch-size",
+        "--kmax",
+        dest="max_batch_size",
+        type=int,
+        default=256,
+        help="largest batch size (power of 2)",
     )
-    parser.add_argument("--reps", type=int, default=3, help="batched repeats per K")
+    parser.add_argument(
+        "--reps",
+        type=int,
+        default=3,
+        help="batched repeats per batch size",
+    )
     parser.add_argument(
         "--start", type=str, default=None, help="ISO start date of a sub-window"
     )
@@ -341,14 +386,27 @@ def main() -> int:
     parser.add_argument(
         "--days", type=int, default=None, help="trailing days of a sub-window"
     )
-    parser.add_argument("--scalar-lanes", type=int, default=1,
-        help="run the ~0.015 s/day/lane scalar baseline only for K <= this (0 disables)")
+    parser.add_argument(
+        "--scalar-lanes",
+        type=int,
+        default=1,
+        help="run the ~0.015 s/day/lane scalar baseline only for batch sizes "
+        "<= this (0 disables)",
+    )
     parser.add_argument(
         "--full-scalar",
         action="store_true",
-        help="run the scalar baseline at every K (very slow on the full record)",
+        help="run the scalar baseline at every batch size "
+        "(very slow on the full record)",
     )
-    parser.add_argument("--profile-k", type=int, default=None, help="cProfile one K")
+    parser.add_argument(
+        "--profile-batch-size",
+        "--profile-k",
+        dest="profile_batch_size",
+        type=int,
+        default=None,
+        help="cProfile one batch size",
+    )
     parser.add_argument("--seed", type=int, default=7, help="RNG seed")
     parser.add_argument("--out", type=str, default=None, help="CSV output path")
     return run(parser.parse_args())

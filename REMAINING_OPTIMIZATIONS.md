@@ -1,5 +1,10 @@
 # Remaining Optimizations for Potions-Py
 
+> **Terminology note:** in historical entries below, `K` denotes the batch
+> size — the number of identical parameter sets (lanes) advanced together in
+> one batched call. Current code and scripts use the explicit name
+> `batch_size`.
+
 ## Current State (After Sessions 1-20)
 
 ### ✅ Completed Optimizations

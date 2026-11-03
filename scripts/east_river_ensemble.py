@@ -20,8 +20,8 @@ Usage from Python::
 
     import east_river_ensemble as ens
     res = ens.run_ensemble(param_sets)   # DataFrame of parameter sets
-    res.q_sim      # (K, T) streamflow [mm/day]
-    res.doc_riv    # (K, T) river DOC [mmol/L]
+    res.q_sim      # (batch_size, T) streamflow [mm/day]
+    res.doc_riv    # (batch_size, T) river DOC [mmol/L]
     res.rt_objectives
     ens.save_ensemble(res, "my_ensemble.pkl")
     res = ens.load_ensemble("my_ensemble.pkl")
@@ -78,18 +78,18 @@ class EnsembleResults:
     """Ensemble of simulation results, one entry per input parameter set.
 
     Attributes:
-        params:           canonical ``(K, NUM_PARAMS)`` parameter frame, in
-            calibration-order columns (missing columns back-filled to the
-            bound midpoints).  Index matches the successful input rows.
+        params:           canonical ``(batch_size, NUM_PARAMS)`` parameter
+            frame, in calibration-order columns (missing columns back-filled to
+            the bound midpoints).  Index matches the successful input rows.
         window:           the simulated dates (full multi-year record by
             default).
-        q_sim:            ``(K, T)`` simulated streamflow [mm/day].
-        doc_riv:          ``(K, T)`` flow-weighted river DOC [mmol/L].
+        q_sim:            ``(batch_size, T)`` simulated streamflow [mm/day].
+        doc_riv:          ``(batch_size, T)`` flow-weighted river DOC [mmol/L].
         hydro_objectives: per-set hydrology objective scores (KSE/NSE/...).
         rt_objectives:    per-set river-DOC objective scores.
-        overflow:         ``(K,)`` ``True`` for sets whose water storage
-            touched a zone's maximum volume (those rows hit the capacity
-            limit; the run itself completes).
+        overflow:         ``(batch_size,)`` ``True`` for sets whose water
+            storage touched a zone's maximum volume (those rows hit the
+            capacity limit; the run itself completes).
         failed:           input row positions whose reactive-transport solve
             did not converge (Newton + Levenberg-Marquardt).  Such rows are
             dropped from the ensemble; the run itself completes.
@@ -174,8 +174,10 @@ def build_full_config() -> tuple[dict[str, tuple[float, float]], Any, DatetimeIn
     return bounds, cfg, window
 
 
-def param_matrix(param_sets: DataFrame, bounds: dict[str, tuple[float, float]]) -> NDArray[np.float64]:
-    """Map a DataFrame of parameter sets to the ``(K, NUM_PARAMS)`` array.
+def param_matrix(
+    param_sets: DataFrame, bounds: dict[str, tuple[float, float]]
+) -> NDArray[np.float64]:
+    """Map a DataFrame of parameter sets to a ``(batch_size, NUM_PARAMS)`` array.
 
     Columns are matched by name (calibration-order names such as
     ``surface_hs.k0``, ``surface_hs.q_10``, ``deep_rp.depth``).  Any column
@@ -187,7 +189,8 @@ def param_matrix(param_sets: DataFrame, bounds: dict[str, tuple[float, float]]) 
         bounds:     parameter-name -> (min, max) bounds in calibration order.
 
     Returns:
-        The ``(K, NUM_PARAMS)`` float64 array in calibration column order.
+        The ``(batch_size, NUM_PARAMS)`` float64 array in calibration column
+        order.
     """
     names: list[str] = list(bounds.keys())
     midpoints: Series = Series(
@@ -225,7 +228,7 @@ def _bisect_rows(
     genuinely unsolvable rows are dropped.
 
     Args:
-        params:       ``(K, NUM_PARAMS)`` parameter array.
+        params:       ``(batch_size, NUM_PARAMS)`` parameter array.
         cfg:          batched config.
         device:       compute device.
         dtype:        compute dtype.
@@ -290,8 +293,8 @@ def run_ensemble(
         init_aq_conc:   initial concentration of non-DOC aqueous species.
 
     Returns:
-        An :class:`EnsembleResults` with ``(K, T)`` streamflow and river-DOC
-        series, per-set objectives and overflow flags.  Rows whose
+        An :class:`EnsembleResults` with ``(batch_size, T)`` streamflow and
+        river-DOC series, per-set objectives and overflow flags.  Rows whose
         reactive-transport solve does not converge are dropped and listed in
         ``failed``.
     """
@@ -302,7 +305,7 @@ def run_ensemble(
 
     bounds, cfg, window = build_full_config()
     params: NDArray[np.float64] = param_matrix(param_sets, bounds)
-    K: int = int(params.shape[0])
+    batch_size: int = int(params.shape[0])
     T: int = len(window)
 
     started: float = time.perf_counter()
@@ -310,23 +313,31 @@ def run_ensemble(
         out = pt.run_hydro_rt_batched(params, cfg, device, dtype, init_aq_conc=init_aq_conc)
         failed: list[int] = []
     except RuntimeError:
-        print(f"   batch solve failed; bisecting over the {K} rows ...")
+        print(
+            f"   batch solve failed; bisecting over the {batch_size} rows ..."
+        )
         wins: list[tuple[int, Any]]
-        wins, failed = _bisect_rows(params, cfg, device, dtype, init_aq_conc, 0, K)
+        wins, failed = _bisect_rows(
+            params, cfg, device, dtype, init_aq_conc, 0, batch_size
+        )
         out = _concat_slices(wins)
     wall: float = time.perf_counter() - started
 
-    K_good: int = int(out.q_sim.shape[0])
+    num_good: int = int(out.q_sim.shape[0])
     labels_: pd.Index = (
-        param_sets.index if not param_sets.index.duplicated().any() else pd.RangeIndex(K)
+        param_sets.index
+        if not param_sets.index.duplicated().any()
+        else pd.RangeIndex(batch_size)
     )
     failed_labels: list[Any] = [labels_[i] for i in failed]
-    good: NDArray[np.int64] = np.array([i for i in range(K) if i not in set(failed)])
+    good: NDArray[np.int64] = np.array(
+        [i for i in range(batch_size) if i not in set(failed)]
+    )
     params_good: NDArray[np.float64] = params[good]
 
     q_sim: NDArray[np.float64] = out.q_sim.detach().cpu().numpy()
     doc_riv: NDArray[np.float64] = out.doc_riv.detach().cpu().numpy()
-    assert q_sim.shape == (K_good, T) and doc_riv.shape == (K_good, T)
+    assert q_sim.shape == (num_good, T) and doc_riv.shape == (num_good, T)
 
     index: pd.Index = labels_[good]
     canonical: DataFrame = DataFrame(
@@ -348,8 +359,9 @@ def run_ensemble(
     if failed_labels:
         print(f"   dropped {len(failed_labels)} non-converging row(s): {failed_labels}")
     print(
-        f"ran {K_good}/{K} parameter set(s) over {T} days on {device} ({dtype}) "
-        f"in {wall / max(K_good, 1) * 1000:.0f} ms/set total {wall:.1f}s"
+        f"ran {num_good}/{batch_size} parameter set(s) over {T} days "
+        f"on {device} ({dtype}) in "
+        f"{wall / max(num_good, 1) * 1000:.0f} ms/set total {wall:.1f}s"
     )
     return results
 
